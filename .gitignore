@@ -1,0 +1,33 @@
+# Models — large binary files, never commit
+models/
+
+# Claude project memory
+.claude/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+
+# Chat memory persistence
+memory.json
+
+# Personal / temp / test
+*.log
+scratch-*
+temp-*
+test-*.js
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

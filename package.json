@@ -1,0 +1,16 @@
+{
+  "name": "purebee",
+  "version": "0.1.0",
+  "description": "A GPU defined entirely in software. Runs Llama 3.2 1B at 3.6 tok/sec. Zero dependencies.",
+  "main": "purebee.js",
+  "scripts": {
+    "chat": "node --max-old-space-size=4096 chat-llama3.js",
+    "download": "node download.js llama3"
+  },
+  "keywords": ["llm", "inference", "webassembly", "gpu", "javascript", "llama", "cpu-inference"],
+  "author": "Benjamin Ryan",
+  "license": "FSL-1.1-Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  }
+}
