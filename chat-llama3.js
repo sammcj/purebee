@@ -87,6 +87,7 @@ function buildLlama3Prompt(userInput, history) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 function parseArgs() {
+  const os = require('os');
   const args = process.argv.slice(2);
   const opts = {
     earlyExit: false,
@@ -95,7 +96,7 @@ function parseArgs() {
     earlyExitInterval: 4,
     noWasm: false,
     cacheRawData: true,
-    threads: true,
+    threads: os.cpus().length - 1,  // default: all cores minus main
   };
 
   for (const arg of args) {
@@ -103,7 +104,11 @@ function parseArgs() {
     if (arg === '--no-speculative') opts.speculative = false;
     if (arg === '--no-wasm') opts.noWasm = true;
     if (arg === '--no-cache') opts.cacheRawData = false;
-    if (arg === '--no-threads') opts.threads = false;
+    if (arg === '--no-threads') opts.threads = 0;
+    if (arg.startsWith('--threads=')) {
+      const val = parseInt(arg.split('=')[1], 10);
+      if (!isNaN(val) && val >= 0) opts.threads = val;
+    }
     if (arg.startsWith('--threshold=')) opts.earlyExitThreshold = parseFloat(arg.split('=')[1]);
   }
 
@@ -182,8 +187,12 @@ async function main() {
 
   // ── Thread pool (parallel matvec) ──
   let threaded = false;
-  if (opts.threads && opts.cacheRawData) {
-    threaded = await llama.initThreadPool();
+  let threadCount = 1;
+  if (opts.threads > 0 && opts.cacheRawData) {
+    threaded = await llama.initThreadPool(opts.threads);
+    if (threaded && llama._threadPool) {
+      threadCount = llama._threadPool.numThreads;
+    }
   }
 
   // ── Find special tokens ──
@@ -239,7 +248,7 @@ async function main() {
   // ── Ready ──
   log();
   log(`${C.green}  Ready.${C.reset} ${C.dim}${config.nLayers} layers, dim=${config.dim}, heap=${heapGB}GB${C.reset}`);
-  log(`${C.dim}  Features: layer-streaming${opts.cacheRawData ? ' + Q4-cached' : ''}${threaded ? ' + 2-thread' : ''}${opts.earlyExit ? ' + early-exit' : ''}${specDecoder ? ' + speculative' : ''} + WASM-SIMD${C.reset}`);
+  log(`${C.dim}  Features: layer-streaming${opts.cacheRawData ? ' + Q4-cached' : ''}${threaded ? ` + ${threadCount}-thread` : ''}${opts.earlyExit ? ' + early-exit' : ''}${specDecoder ? ' + speculative' : ''} + WASM-SIMD${C.reset}`);
   log();
   log(`${C.dim}  Commands: /reset  /temp N  /tokens N  /stats  /quit${C.reset}`);
   log();
@@ -358,31 +367,13 @@ async function main() {
       const elapsed = Date.now() - genStart;
       log();
       log(`${C.dim}  ${result.generated} tokens | ${result.tokPerSec.toFixed(1)} tok/s | ${elapsed}ms | accepted ${result.acceptanceRate}${C.reset}`);
-    } else if (threaded) {
-      // Threaded generation (async decode with parallel FFN matvec)
-      const result = await llama.generateAsync(promptTokens, maxTokens, {
-        temperature,
-        topK,
-        eosId: eosIds[0],
-        onToken: (tokenId, idx, layersUsed) => {
-          if (eosIds.includes(tokenId)) return;
-          const text = tokenizer.decodeToken(tokenId, prevToken);
-          responseText += text;
-          process.stdout.write(`${C.yellow}${text}${C.reset}`);
-          prevToken = tokenId;
-        },
-      });
-
-      const elapsed = Date.now() - genStart;
-      log();
-      log(`${C.dim}  ${result.generated} tokens | ${result.tokPerSec.toFixed(1)} tok/s | ${elapsed}ms | avg ${result.avgLayers}/${config.nLayers} layers | early exits: ${result.earlyExits}${C.reset}`);
     } else {
-      // Standard generation with layer streaming
+      // Standard generation (threading is implicit via Atomics when pool is active)
       const result = llama.generate(promptTokens, maxTokens, {
         temperature,
         topK,
         eosId: eosIds[0],
-        onToken: (tokenId, idx, layersUsed) => {
+        onToken: (tokenId) => {
           if (eosIds.includes(tokenId)) return;
           const text = tokenizer.decodeToken(tokenId, prevToken);
           responseText += text;

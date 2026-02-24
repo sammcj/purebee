@@ -26,7 +26,7 @@ const { Tensor } = require('./memory');
 const wasmSimd = require('./wasm-simd');
 const wasmQ4 = require('./wasm-q4');
 const { GGML_TYPE } = require('./gguf');
-const { MatvecThreadPool } = require('./thread-pool');
+const { AtomicsThreadPool } = require('./thread-pool');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Q4_0 / Q4_1 Matrix-Vector Multiply
@@ -221,22 +221,24 @@ class StreamingLlamaRuntime {
   }
 
   /**
-   * Initialize worker thread pool for parallel matvec.
+   * Initialise worker thread pool for parallel matvec.
    * Call after loadResidentWeights(). Requires SharedArrayBuffer-backed raw cache.
    *
+   * @param {number} [numWorkers] -- defaults to os.cpus().length - 1
    * @returns {Promise<boolean>} true if thread pool is ready
    */
-  async initThreadPool() {
+  async initThreadPool(numWorkers) {
     const sharedBuffer = this.loader.getSharedBuffer ? this.loader.getSharedBuffer() : null;
     if (!sharedBuffer) {
-      console.log('  [StreamingLLaMA] No SharedArrayBuffer — skipping thread pool');
+      console.log('  [StreamingLLaMA] No SharedArrayBuffer -- skipping thread pool');
       return false;
     }
 
-    this._threadPool = new MatvecThreadPool();
-    const ok = await this._threadPool.init(sharedBuffer);
+    const { dim, hiddenDim, vocabSize } = this.config;
+    this._threadPool = new AtomicsThreadPool(numWorkers);
+    const ok = await this._threadPool.init(sharedBuffer, { dim, hiddenDim, vocabSize });
     if (ok) {
-      console.log('  [StreamingLLaMA] Thread pool initialized (2-thread parallel matvec)');
+      console.log(`  [StreamingLLaMA] Thread pool: ${this._threadPool.numThreads} threads (${this._threadPool.numThreads - 1} workers + main)`);
     }
     return ok;
   }
@@ -492,11 +494,12 @@ class StreamingLlamaRuntime {
 
   /**
    * Run one transformer layer using raw Q4_0/Q4_1 weights directly.
-   * Skips dequantization, transposition, and WASM weight caching.
+   * Skips dequantisation, transposition, and WASM weight caching.
    * Only handles seqLen=1 (decode mode).
+   * When thread pool is available, all matvecs are threaded across all cores.
    *
-   * @param {number} l — layer index
-   * @param {Object} layerData — from loader.loadLayerWeightsRaw()
+   * @param {number} l -- layer index
+   * @param {Object} layerData -- from loader.loadLayerWeightsRaw()
    * @param {number} startPos
    */
   _runLayerQ4(l, layerData, startPos) {
@@ -505,6 +508,8 @@ class StreamingLlamaRuntime {
     const kvDim = nKvHeads * headDim;
     const cacheLen = startPos + 1;
     const raw = layerData.raw;
+    const tp = this._threadPool;
+    const threaded = tp && tp.available;
 
     // Write norm weights (always F32, small)
     gpu.GRID_WRITE('layer.rms_att', [dim], layerData.rms_att);
@@ -512,13 +517,16 @@ class StreamingLlamaRuntime {
 
     // ── Pre-attention RMS Norm ──
     gpu.RMS_NORM('x', 'layer.rms_att', 'xnorm');
-    const xnorm = gpu.GRID_READ('xnorm');
-    const xnormData = xnorm.data;
+    const xnormData = gpu.GRID_READ('xnorm').data;
 
-    // ── QKV Projections (quantized matvec) ──
-    const qData = quantizedMatvec(xnormData, raw.wq.rawBuf, raw.wq.type, raw.wq.N, raw.wq.K);
-    const kData = quantizedMatvec(xnormData, raw.wk.rawBuf, raw.wk.type, raw.wk.N, raw.wk.K);
-    const vData = quantizedMatvec(xnormData, raw.wv.rawBuf, raw.wv.type, raw.wv.N, raw.wv.K);
+    // ── QKV Projections (threaded when pool available) ──
+    const mv = (x, w) => threaded
+      ? tp.matvec(x, w.rawBuf, w.type, w.N, w.K)
+      : quantizedMatvec(x, w.rawBuf, w.type, w.N, w.K);
+
+    const qData = mv(xnormData, raw.wq);
+    const kData = mv(xnormData, raw.wk);
+    const vData = mv(xnormData, raw.wv);
 
     // ── RoPE ──
     this._applyRoPE(qData, kData, 1, startPos);
@@ -564,107 +572,8 @@ class StreamingLlamaRuntime {
       }
     }
 
-    // ── Output Projection (quantized matvec) ──
-    const attnProj = quantizedMatvec(attnOut, raw.wo.rawBuf, raw.wo.type, raw.wo.N, raw.wo.K);
-
-    // ── Residual ──
-    const xData = gpu.GRID_READ('x');
-    for (let d = 0; d < dim; d++) xData.data[d] += attnProj[d];
-
-    // ── Pre-FFN RMS Norm ──
-    gpu.RMS_NORM('x', 'layer.rms_ffn', 'xnorm');
-    const xnorm2 = gpu.GRID_READ('xnorm');
-    const xnormData2 = xnorm2.data;
-
-    // ── SwiGLU FFN (quantized matvec) ──
-    const gateOut = quantizedMatvec(xnormData2, raw.w1.rawBuf, raw.w1.type, raw.w1.N, raw.w1.K);
-    const upOut = quantizedMatvec(xnormData2, raw.w3.rawBuf, raw.w3.type, raw.w3.N, raw.w3.K);
-
-    // SiLU(gate) * up
-    const ffHidden = new Float32Array(hiddenDim);
-    for (let i = 0; i < hiddenDim; i++) {
-      const silu = gateOut[i] / (1 + Math.exp(-gateOut[i]));  // SiLU = x * sigmoid(x)
-      ffHidden[i] = silu * upOut[i];
-    }
-
-    // Down projection
-    const ffOut = quantizedMatvec(ffHidden, raw.w2.rawBuf, raw.w2.type, raw.w2.N, raw.w2.K);
-
-    // ── Residual ──
-    for (let d = 0; d < dim; d++) xData.data[d] += ffOut[d];
-
-    // Free norm weights
-    gpu.FREE('layer.rms_att');
-    gpu.FREE('layer.rms_ffn');
-  }
-
-  /**
-   * Async Q4 layer with threaded matvec for large matrices.
-   * Worker handles top half of rows, main thread handles bottom half.
-   */
-  async _runLayerQ4Async(l, layerData, startPos) {
-    const gpu = this.gpu;
-    const { dim, hiddenDim, nHeads, nKvHeads, headDim } = this.config;
-    const kvDim = nKvHeads * headDim;
-    const cacheLen = startPos + 1;
-    const raw = layerData.raw;
-    const tp = this._threadPool;
-
-    gpu.GRID_WRITE('layer.rms_att', [dim], layerData.rms_att);
-    gpu.GRID_WRITE('layer.rms_ffn', [dim], layerData.rms_ffn);
-
-    // ── Pre-attention RMS Norm ──
-    gpu.RMS_NORM('x', 'layer.rms_att', 'xnorm');
-    const xnormData = gpu.GRID_READ('xnorm').data;
-
-    // ── QKV Projections (all ≤2048 rows — faster single-threaded) ──
-    const qData = quantizedMatvec(xnormData, raw.wq.rawBuf, raw.wq.type, raw.wq.N, raw.wq.K);
-    const kData = quantizedMatvec(xnormData, raw.wk.rawBuf, raw.wk.type, raw.wk.N, raw.wk.K);
-    const vData = quantizedMatvec(xnormData, raw.wv.rawBuf, raw.wv.type, raw.wv.N, raw.wv.K);
-
-    // ── RoPE ──
-    this._applyRoPE(qData, kData, 1, startPos);
-
-    // ── Update KV Cache ──
-    const keyCache = gpu.GRID_READ(`kv_k_${l}`);
-    const valCache = gpu.GRID_READ(`kv_v_${l}`);
-    const dstOffset = startPos * kvDim;
-    for (let d = 0; d < kvDim; d++) {
-      keyCache.data[dstOffset + d] = kData[d];
-      valCache.data[dstOffset + d] = vData[d];
-    }
-
-    // ── Multi-Head Attention (same as sync — small compute) ──
-    const headsPerKvHead = nHeads / nKvHeads;
-    const attnOut = new Float32Array(dim);
-    const scale = 1.0 / Math.sqrt(headDim);
-
-    for (let h = 0; h < nHeads; h++) {
-      const kvH = Math.floor(h / headsPerKvHead);
-      const scores = new Float32Array(cacheLen);
-      for (let j = 0; j < cacheLen; j++) {
-        let dot = 0;
-        for (let d = 0; d < headDim; d++) {
-          dot += qData[h * headDim + d] * keyCache.data[j * kvDim + kvH * headDim + d];
-        }
-        scores[j] = dot * scale;
-      }
-      let maxScore = -Infinity;
-      for (let j = 0; j < cacheLen; j++) if (scores[j] > maxScore) maxScore = scores[j];
-      let sumExp = 0;
-      for (let j = 0; j < cacheLen; j++) { scores[j] = Math.exp(scores[j] - maxScore); sumExp += scores[j]; }
-      for (let j = 0; j < cacheLen; j++) scores[j] /= sumExp;
-      for (let d = 0; d < headDim; d++) {
-        let val = 0;
-        for (let j = 0; j < cacheLen; j++) {
-          val += scores[j] * valCache.data[j * kvDim + kvH * headDim + d];
-        }
-        attnOut[h * headDim + d] = val;
-      }
-    }
-
-    // ── Output Projection (2048 rows — faster single-threaded) ──
-    const attnProj = quantizedMatvec(attnOut, raw.wo.rawBuf, raw.wo.type, raw.wo.N, raw.wo.K);
+    // ── Output Projection (threaded) ──
+    const attnProj = mv(attnOut, raw.wo);
 
     // ── Residual ──
     const xData = gpu.GRID_READ('x');
@@ -674,34 +583,28 @@ class StreamingLlamaRuntime {
     gpu.RMS_NORM('x', 'layer.rms_ffn', 'xnorm');
     const xnormData2 = gpu.GRID_READ('xnorm').data;
 
-    // ── SwiGLU FFN (thread w1, w3 in parallel, then w2) ──
-    const gatePromise = tp.splitMatvec(xnormData2, raw.w1.rawBuf, raw.w1.type, raw.w1.N, raw.w1.K);
-    const upPromise = tp.splitMatvec(xnormData2, raw.w3.rawBuf, raw.w3.type, raw.w3.N, raw.w3.K);
-    const gateOut = await gatePromise;
-    const upOut = await upPromise;
+    // ── SwiGLU FFN (threaded) ──
+    const gateOut = mv(xnormData2, raw.w1);
+    const upOut = mv(xnormData2, raw.w3);
 
+    // SiLU(gate) * up
     const ffHidden = new Float32Array(hiddenDim);
     for (let i = 0; i < hiddenDim; i++) {
       const silu = gateOut[i] / (1 + Math.exp(-gateOut[i]));
       ffHidden[i] = silu * upOut[i];
     }
 
-    const ffOut = await tp.splitMatvec(ffHidden, raw.w2.rawBuf, raw.w2.type, raw.w2.N, raw.w2.K);
+    // Down projection (threaded)
+    const ffOut = mv(ffHidden, raw.w2);
 
     // ── Residual ──
     for (let d = 0; d < dim; d++) xData.data[d] += ffOut[d];
 
+    // Free norm weights
     gpu.FREE('layer.rms_att');
     gpu.FREE('layer.rms_ffn');
   }
 
-  /**
-   * Async compute logits — uses sync LM head (embedding is not in SharedArrayBuffer).
-   * Threading benefit is in layers, not LM head (~100ms single-threaded is acceptable).
-   */
-  async _computeLogitsAsync(hiddenState) {
-    return this._computeLogits(hiddenState);
-  }
 
   /**
    * Compute logits from hidden state using LM head.
@@ -724,13 +627,18 @@ class StreamingLlamaRuntime {
       : gpu.GRID_READ('lm_head');
 
     let logits;
+    const tp = this._threadPool;
+    const embIsShared = lmWeight.data.buffer instanceof SharedArrayBuffer;
 
-    if (this._wasmReady && lmWeight._wasmPtr !== undefined) {
-      // Embedding is WASM-cached — use fast path (small vocabs)
+    if (tp && tp.available && embIsShared) {
+      // Threaded LM head: partition vocab rows across all cores
+      logits = tp.lmHead(normed.data, lmWeight.data, vocabSize, dim);
+    } else if (this._wasmReady && lmWeight._wasmPtr !== undefined) {
+      // Embedding is WASM-cached -- use fast path (small vocabs)
       logits = new Float32Array(vocabSize);
       wasmSimd.matmulCached(normed.data, 1, dim, lmWeight._wasmPtr, vocabSize, null, logits);
     } else if (_wasmQ4Ready || initWasmQ4()) {
-      // WASM SIMD batch_dot — no transpose, process row-major chunks
+      // WASM SIMD batch_dot -- no transpose, process row-major chunks
       logits = wasmQ4.lmHead(normed.data, lmWeight.data, vocabSize, dim);
     } else if (this._wasmReady) {
       // Chunked WASM fallback (with transpose)
@@ -907,67 +815,11 @@ class StreamingLlamaRuntime {
   }
 
   /**
-   * Async forward pass with threaded matvec.
-   * Uses worker thread for large Q4 matrices (w1, w2, w3, wq, wo) and LM head.
+   * Async forward pass -- kept for API compatibility.
+   * Threading is now synchronous via Atomics, so this just wraps forward().
    */
   async forwardAsync(tokenIds, startPos = 0, options = {}) {
-    if (!this._loaded) throw new Error('Resident weights not loaded');
-    if (!this._kvInitialized) this._initKVCache();
-
-    const gpu = this.gpu;
-    const { dim, nLayers, vocabSize } = this.config;
-    const seqLen = tokenIds.length;
-    const maxLayers = options.maxLayers || nLayers;
-
-    // ── EMBEDDING LOOKUP ──
-    const wte = gpu.GRID_READ('token_embedding');
-    const xData = new Float32Array(seqLen * dim);
-    for (let i = 0; i < seqLen; i++) {
-      const tok = tokenIds[i];
-      const srcOffset = tok * dim;
-      const dstOffset = i * dim;
-      for (let d = 0; d < dim; d++) {
-        xData[dstOffset + d] = wte.data[srcOffset + d];
-      }
-    }
-    gpu.GRID_WRITE('x', [seqLen, dim], xData);
-
-    // ── TRANSFORMER BLOCKS ──
-    let layersUsed = 0;
-    const layerLimit = Math.min(maxLayers, nLayers);
-    const useQ4Async = seqLen === 1 && this.loader.loadLayerWeightsRaw && this._threadPool && this._threadPool.available;
-    const useQ4 = seqLen === 1 && this.loader.loadLayerWeightsRaw;
-
-    for (let l = 0; l < layerLimit; l++) {
-      if (useQ4Async) {
-        const layerData = this.loader.loadLayerWeightsRaw(l);
-        await this._runLayerQ4Async(l, layerData, startPos);
-      } else if (useQ4) {
-        const layerData = this.loader.loadLayerWeightsRaw(l);
-        this._runLayerQ4(l, layerData, startPos);
-      } else {
-        if (l + 1 < layerLimit) this.loader.prefetchLayer(l + 1);
-        const layerWeights = this.loader.loadLayerWeights(l);
-        this._runLayer(l, layerWeights, seqLen, startPos);
-      }
-      layersUsed++;
-    }
-
-    this._layersUsed += layersUsed;
-    this._totalForwards++;
-
-    // ── FINAL LM HEAD ──
-    const xFinal = gpu.GRID_READ('x');
-    const lastOffset = (seqLen - 1) * dim;
-    const lastHidden = new Float32Array(dim);
-    for (let d = 0; d < dim; d++) {
-      lastHidden[d] = xFinal.data[lastOffset + d];
-    }
-    const logits = await this._computeLogitsAsync(lastHidden);
-    this._lastExitLayer = layersUsed - 1;
-
-    gpu.SYNC();
-    return { logits, layersUsed };
+    return this.forward(tokenIds, startPos, options);
   }
 
   /**
@@ -1118,64 +970,11 @@ class StreamingLlamaRuntime {
   }
 
   /**
-   * Async generate with threaded matvec.
+   * Async generate -- kept for API compatibility.
+   * Threading is now synchronous via Atomics, so this just wraps generate().
    */
   async generateAsync(promptTokens, maxTokens = 50, opts = {}) {
-    const temperature = opts.temperature || 0.8;
-    const topK = opts.topK || 40;
-    const onToken = opts.onToken || null;
-    const eosId = opts.eosId || 2;
-    const greedy = opts.greedy || false;
-
-    this.resetCache();
-    this._layersUsed = 0;
-    this._totalForwards = 0;
-    this._earlyExits = 0;
-
-    const allTokens = [...promptTokens];
-    let pos = 0;
-
-    // ── PREFILL (sync — prefill uses standard path, not Q4 fast path) ──
-    const prefillStart = Date.now();
-    const { logits } = this.forward(promptTokens, 0);
-    const prefillTime = Date.now() - prefillStart;
-    pos = promptTokens.length;
-
-    let nextToken = greedy ? this.argmax(logits) : this.sample(logits, topK, temperature);
-    allTokens.push(nextToken);
-    if (onToken) onToken(nextToken, 0);
-
-    // ── DECODE (async — uses threaded matvec) ──
-    const decodeStart = Date.now();
-    let generated = 1;
-
-    for (let i = 1; i < maxTokens; i++) {
-      if (nextToken === eosId) break;
-
-      const { logits: stepLogits, layersUsed } = await this.forwardAsync([nextToken], pos);
-      pos++;
-
-      nextToken = greedy ? this.argmax(stepLogits) : this.sample(stepLogits, topK, temperature);
-      allTokens.push(nextToken);
-      generated++;
-
-      if (onToken) onToken(nextToken, i, layersUsed);
-      if (nextToken === eosId) break;
-    }
-
-    const decodeTime = Date.now() - decodeStart;
-    const decodedTokens = Math.max(generated - 1, 1);
-    const tokPerSec = decodedTokens / (decodeTime / 1000);
-
-    return {
-      tokens: allTokens,
-      generated,
-      prefillTime,
-      decodeTime,
-      tokPerSec,
-      avgLayers: this._totalForwards > 0 ? (this._layersUsed / this._totalForwards).toFixed(1) : this.config.nLayers,
-      earlyExits: this._earlyExits,
-    };
+    return this.generate(promptTokens, maxTokens, opts);
   }
 
   /**
