@@ -1,15 +1,22 @@
 /**
- * PureBee — Thread Pool for Parallel Matvec
+ * PureBee -- Atomics-Based Multi-Core Thread Pool
  *
- * Creates a single worker thread at startup. Splits large matvec
- * operations across main thread and worker for ~2x speedup.
+ * Spawns N worker threads that spin on Atomics.wait. Dispatches matvec
+ * work via shared memory descriptors + Atomics.notify. Main thread
+ * computes its own partition simultaneously. Fully synchronous from
+ * the caller's perspective.
  *
- * Design:
- *   - Worker receives SharedArrayBuffer reference once at init
- *   - For each matvec: worker computes top half, main thread computes bottom half
- *   - Input vector x is small (dim * 4 bytes) — copied via postMessage
- *   - Output is transferred back (zero-copy via Transferable)
- *   - Small matrices (N < threshold) run on main thread only
+ * Shared memory layout:
+ *   controlBuf: 64-byte header + 64 bytes per worker slot
+ *     Header Int32[0]: numWorkers
+ *     Header Int32[1]: readyCount (workers increment on init)
+ *     Slot Int32[0]: status (0=IDLE, 1=WORK_READY, 255=SHUTDOWN)
+ *     Slot Int32[1]: opType (1=Q4_MATVEC, 2=LM_HEAD)
+ *     Slot Int32[2..9]: work descriptor fields
+ *
+ *   ioBuf: shared input/output vectors
+ *     [0, maxK*4): input vector x
+ *     [maxK*4, maxK*4+maxN*4): output vector y
  *
  * Zero external dependencies.
  */
@@ -17,230 +24,322 @@
 'use strict';
 
 const { Worker } = require('worker_threads');
+const os = require('os');
 const path = require('path');
 const wasmQ4 = require('./wasm-q4');
 
-// Minimum output rows to justify threading overhead (~1-2ms message cost)
-// Only thread large FFN matrices (8192 rows), not attention (2048 rows)
-const MIN_ROWS_FOR_THREADING = 4096;
+// Status constants (must match worker-matvec.js)
+const WORK_READY = 1;
+const SHUTDOWN = 255;
 
-class MatvecThreadPool {
-  constructor() {
-    this._worker = null;
+// Op types
+const OP_Q4_MATVEC = 1;
+const OP_LM_HEAD = 2;
+
+// Control buffer layout
+const HEADER_INTS = 16;  // 64 bytes
+const SLOT_INTS = 16;    // 64 bytes per worker
+
+// Slot field offsets
+const F_STATUS = 0;
+const F_OP_TYPE = 1;
+const F_WEIGHT_OFFSET = 2;
+const F_START_ROW = 4;
+const F_END_ROW = 5;
+const F_N = 6;
+const F_K = 7;
+const F_QUANT_TYPE = 8;
+const F_EMB_OFFSET = 9;
+
+// Atomics.wait timeout (safety net)
+const WAIT_TIMEOUT_MS = 5000;
+
+class AtomicsThreadPool {
+  /**
+   * @param {number} [numWorkers] -- defaults to os.cpus().length - 1
+   */
+  constructor(numWorkers) {
+    this._numWorkers = numWorkers || Math.max(1, os.cpus().length - 1);
+    this._workers = [];
     this._ready = false;
-    this._pendingInit = null;
-    this._pending = new Map();  // id → { resolve, reject }
-    this._nextId = 0;
-    this._sharedBuffer = null;
+    this._controlBuf = null;
+    this._control = null;
+    this._ioBuf = null;
+    this._weightBuf = null;
+    this._maxK = 0;
+    this._maxN = 0;
   }
 
   /**
-   * Initialize the thread pool with one worker.
-   * @param {SharedArrayBuffer} sharedBuffer — raw weight cache
+   * Spawn workers and allocate shared buffers.
+   *
+   * @param {SharedArrayBuffer} weightBuf -- raw weight cache from streaming-loader
+   * @param {Object} config -- { dim, hiddenDim, vocabSize }
    * @returns {Promise<boolean>}
    */
-  async init(sharedBuffer) {
-    if (!sharedBuffer || !(sharedBuffer instanceof SharedArrayBuffer)) {
-      console.log('  [ThreadPool] No SharedArrayBuffer — single-threaded mode');
+  async init(weightBuf, config) {
+    if (!weightBuf || !(weightBuf instanceof SharedArrayBuffer)) {
+      console.log('  [ThreadPool] No SharedArrayBuffer -- single-threaded mode');
       return false;
     }
 
-    this._sharedBuffer = sharedBuffer;
+    this._weightBuf = weightBuf;
 
-    return new Promise((resolve) => {
-      const workerPath = path.join(__dirname, 'worker-matvec.js');
-      this._worker = new Worker(workerPath);
+    // Compute max dimensions for ioBuf sizing
+    // maxK: largest input dimension (hiddenDim for w2 down-projection)
+    // maxN: largest output dimension (vocabSize for LM head)
+    this._maxK = Math.max(config.dim, config.hiddenDim);
+    this._maxN = Math.max(config.vocabSize, config.hiddenDim);
 
-      this._worker.on('message', (msg) => {
-        if (msg.type === 'ready') {
-          this._ready = true;
-          console.log('  [ThreadPool] Worker ready');
-          resolve(true);
-        } else if (msg.type === 'result') {
-          const p = this._pending.get(msg.id);
-          if (p) {
-            this._pending.delete(msg.id);
-            p.resolve(msg);
-          }
-        } else if (msg.type === 'error') {
-          console.warn('  [ThreadPool] Worker error:', msg.msg);
-          if (msg.id !== undefined) {
-            const p = this._pending.get(msg.id);
-            if (p) {
-              this._pending.delete(msg.id);
-              p.reject(new Error(msg.msg));
-            }
-          }
-          if (!this._ready) resolve(false);
-        }
+    // Allocate control buffer: header + slots for all workers
+    const controlBytes = (HEADER_INTS + this._numWorkers * SLOT_INTS) * 4;
+    this._controlBuf = new SharedArrayBuffer(controlBytes);
+    this._control = new Int32Array(this._controlBuf);
+    this._control[0] = this._numWorkers;
+    this._control[1] = 0; // readyCount
+
+    // Allocate I/O buffer: input x + output y
+    const ioBytes = (this._maxK + this._maxN) * 4;
+    this._ioBuf = new SharedArrayBuffer(ioBytes);
+
+    // Spawn workers
+    const workerPath = path.join(__dirname, 'worker-matvec.js');
+
+    for (let i = 0; i < this._numWorkers; i++) {
+      const worker = new Worker(workerPath, {
+        workerData: {
+          controlBuf: this._controlBuf,
+          weightBuf: this._weightBuf,
+          ioBuf: this._ioBuf,
+          workerId: i,
+          maxK: this._maxK,
+          maxN: this._maxN,
+        },
       });
 
-      this._worker.on('error', (err) => {
-        console.warn('  [ThreadPool] Worker crashed:', err.message);
-        this._ready = false;
-        if (!this._ready) resolve(false);
+      worker.on('error', (err) => {
+        console.warn(`  [ThreadPool] Worker ${i} error:`, err.message);
       });
 
-      // Send shared buffer to worker
-      this._worker.postMessage({ type: 'init', sharedBuffer });
-    });
+      this._workers.push(worker);
+    }
+
+    // Wait for all workers to signal ready
+    const deadline = Date.now() + WAIT_TIMEOUT_MS;
+    while (Atomics.load(this._control, 1) < this._numWorkers) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        console.warn(`  [ThreadPool] Timeout waiting for workers (${Atomics.load(this._control, 1)}/${this._numWorkers} ready)`);
+        await this.shutdown();
+        return false;
+      }
+      Atomics.wait(this._control, 1, Atomics.load(this._control, 1), Math.min(remaining, 100));
+    }
+
+    this._ready = true;
+    console.log(`  [ThreadPool] ${this._numWorkers} workers ready`);
+    return true;
   }
 
-  /**
-   * Check if thread pool is available.
-   */
   get available() {
     return this._ready;
   }
 
-  /**
-   * Dispatch a matvec to the worker thread. Returns a promise.
-   * @private
-   */
-  _dispatchMatvec(xBuf, rawOffset, rawLength, quantType, startRow, endRow, N, K) {
-    const id = this._nextId++;
-    return new Promise((resolve, reject) => {
-      this._pending.set(id, { resolve, reject });
-      this._worker.postMessage(
-        { type: 'matvec', id, xBuf, rawOffset, rawLength, quantType, startRow, endRow, N, K },
-        [xBuf]  // transfer x buffer to worker
-      );
-    });
+  get numThreads() {
+    return this._ready ? this._numWorkers + 1 : 1;
   }
 
   /**
-   * Dispatch an LM head slice to the worker. Returns a promise.
-   * @private
-   */
-  _dispatchLmHead(hiddenBuf, embOffset, embLength, startRow, endRow, vocabSize, dim) {
-    const id = this._nextId++;
-    return new Promise((resolve, reject) => {
-      this._pending.set(id, { resolve, reject });
-      this._worker.postMessage(
-        { type: 'lmhead', id, hiddenBuf, embOffset, embLength, startRow, endRow, vocabSize, dim },
-        [hiddenBuf]
-      );
-    });
-  }
-
-  /**
-   * Split a Q4 matvec across main thread and worker.
-   * Worker gets the top half of rows, main thread gets the bottom half.
-   * Both run simultaneously; results are concatenated.
+   * Synchronous threaded Q4 matvec: y[N] = W_q4[N,K] @ x[K]
    *
-   * @param {Float32Array} x — input vector [K]
-   * @param {Uint8Array} rawBuf — raw Q4 weight data (view into SharedArrayBuffer)
-   * @param {number} quantType — GGML_TYPE.Q4_0 (2) or Q4_1 (3)
-   * @param {number} N — total output rows
-   * @param {number} K — input dimension
-   * @returns {Promise<Float32Array>} — output vector [N]
+   * Partitions rows across (numWorkers + 1) threads. Main thread
+   * computes its own partition while workers run in parallel.
+   *
+   * @param {Float32Array} x -- input vector [K]
+   * @param {Uint8Array} rawBuf -- raw Q4 weight data (view into weightBuf)
+   * @param {number} quantType -- 2=Q4_0, 3=Q4_1
+   * @param {number} N -- output rows
+   * @param {number} K -- input dimension
+   * @returns {Float32Array} -- output [N]
    */
-  async splitMatvec(x, rawBuf, quantType, N, K) {
-    // Skip threading for small matrices
-    if (!this._ready || N < MIN_ROWS_FOR_THREADING) {
-      if (quantType === 2) return wasmQ4.q4_0_matvec(x, rawBuf, N, K);
-      return wasmQ4.q4_1_matvec(x, rawBuf, N, K);
-    }
+  matvec(x, rawBuf, quantType, N, K) {
+    const totalThreads = this._numWorkers + 1;
+    const activeThreads = Math.min(totalThreads, N);
+    const activeWorkers = activeThreads - 1; // reserve 1 for main
 
-    // Split rows: worker gets top half, main thread gets bottom half
-    const splitRow = N >>> 1;
+    // Write input x into ioBuf
+    const ioX = new Float32Array(this._ioBuf, 0, K);
+    ioX.set(x);
 
-    // Copy x for the worker (x is small — dim*4 bytes)
-    const xCopy = new Float32Array(K);
-    xCopy.set(x);
+    // Partition rows evenly
+    const rowsPerThread = Math.floor(N / activeThreads);
+    const extraRows = N % activeThreads;
 
-    // rawBuf must be a view into the SharedArrayBuffer
-    const rawOffset = rawBuf.byteOffset;
-    const rawLength = rawBuf.byteLength;
-
-    // Dispatch top half to worker
-    const workerPromise = this._dispatchMatvec(
-      xCopy.buffer, rawOffset, rawLength, quantType,
-      0, splitRow, N, K
-    );
-
-    // Compute bottom half on main thread
+    // Weight data byte offset (rawBuf is a view into weightBuf)
+    const weightOffset = rawBuf.byteOffset;
     const blocksPer = K >>> 5;
     const bytesPerRow = quantType === 2 ? blocksPer * 18 : blocksPer * 20;
-    const mainOffset = splitRow * bytesPerRow;
-    const mainN = N - splitRow;
-    const mainRaw = new Uint8Array(rawBuf.buffer, rawBuf.byteOffset + mainOffset, mainN * bytesPerRow);
 
-    let mainResult;
-    if (quantType === 2) {
-      mainResult = wasmQ4.q4_0_matvec(x, mainRaw, mainN, K);
-    } else {
-      mainResult = wasmQ4.q4_1_matvec(x, mainRaw, mainN, K);
+    // Dispatch to workers
+    let rowStart = 0;
+    for (let w = 0; w < activeWorkers; w++) {
+      const rows = rowsPerThread + (w < extraRows ? 1 : 0);
+      const rowEnd = rowStart + rows;
+
+      const slotBase = HEADER_INTS + w * SLOT_INTS;
+      this._control[slotBase + F_OP_TYPE] = OP_Q4_MATVEC;
+      this._control[slotBase + F_WEIGHT_OFFSET] = weightOffset;
+      this._control[slotBase + F_START_ROW] = rowStart;
+      this._control[slotBase + F_END_ROW] = rowEnd;
+      this._control[slotBase + F_N] = N;
+      this._control[slotBase + F_K] = K;
+      this._control[slotBase + F_QUANT_TYPE] = quantType;
+
+      // Signal worker
+      Atomics.store(this._control, slotBase + F_STATUS, WORK_READY);
+      Atomics.notify(this._control, slotBase + F_STATUS);
+
+      rowStart = rowEnd;
     }
 
-    // Wait for worker result
-    const workerMsg = await workerPromise;
-    const workerResult = new Float32Array(workerMsg.output);
+    // Main thread computes remaining rows
+    const mainStartRow = rowStart;
+    const mainN = N - mainStartRow;
 
-    // Concatenate: [worker top half | main bottom half]
+    if (mainN > 0) {
+      const mainByteOffset = mainStartRow * bytesPerRow;
+      const mainRaw = new Uint8Array(
+        rawBuf.buffer, rawBuf.byteOffset + mainByteOffset, mainN * bytesPerRow
+      );
+
+      let mainResult;
+      if (quantType === 2) {
+        mainResult = wasmQ4.q4_0_matvec(x, mainRaw, mainN, K);
+      } else {
+        mainResult = wasmQ4.q4_1_matvec(x, mainRaw, mainN, K);
+      }
+
+      // Write main thread's result to ioBuf
+      const outView = new Float32Array(
+        this._ioBuf, this._maxK * 4 + mainStartRow * 4, mainN
+      );
+      outView.set(mainResult);
+    }
+
+    // Wait for all workers to finish
+    for (let w = 0; w < activeWorkers; w++) {
+      const statusIdx = HEADER_INTS + w * SLOT_INTS + F_STATUS;
+      let waitResult = Atomics.wait(this._control, statusIdx, WORK_READY, WAIT_TIMEOUT_MS);
+      if (waitResult === 'timed-out') {
+        // Worker still running -- wait once more with extended timeout
+        waitResult = Atomics.wait(this._control, statusIdx, WORK_READY, WAIT_TIMEOUT_MS);
+        if (waitResult === 'timed-out') {
+          throw new Error(`ThreadPool: worker ${w} timed out on matvec (10s)`);
+        }
+      }
+    }
+
+    // Read combined output from ioBuf
     const output = new Float32Array(N);
-    output.set(workerResult, 0);
-    output.set(mainResult, splitRow);
-
+    output.set(new Float32Array(this._ioBuf, this._maxK * 4, N));
     return output;
   }
 
   /**
-   * Split LM head computation across main thread and worker.
+   * Synchronous threaded LM head: logits[vocabSize] = embedding[vocabSize,dim] @ hidden[dim]
    *
-   * @param {Float32Array} hidden — normalized hidden state [dim]
-   * @param {Float32Array} embData — embedding weights [vocabSize * dim] (in SharedArrayBuffer)
-   * @param {number} vocabSize — total vocab size
-   * @param {number} dim — embedding dimension
-   * @returns {Promise<Float32Array>} — logits [vocabSize]
+   * @param {Float32Array} hidden -- normalised hidden state [dim]
+   * @param {Float32Array} embData -- embedding weights (in SharedArrayBuffer)
+   * @param {number} vocabSize -- total vocab size
+   * @param {number} dim -- embedding dimension
+   * @returns {Float32Array} -- logits [vocabSize]
    */
-  async splitLmHead(hidden, embData, vocabSize, dim) {
-    if (!this._ready) {
-      return wasmQ4.lmHead(hidden, embData, vocabSize, dim);
+  lmHead(hidden, embData, vocabSize, dim) {
+    const totalThreads = this._numWorkers + 1;
+    const activeThreads = Math.min(totalThreads, vocabSize);
+    const activeWorkers = activeThreads - 1;
+
+    // Write hidden into ioBuf input region
+    const ioX = new Float32Array(this._ioBuf, 0, dim);
+    ioX.set(hidden);
+
+    const rowsPerThread = Math.floor(vocabSize / activeThreads);
+    const extraRows = vocabSize % activeThreads;
+
+    // embData byte offset within its backing SharedArrayBuffer
+    const embOffset = embData.byteOffset;
+
+    // Dispatch to workers
+    let rowStart = 0;
+    for (let w = 0; w < activeWorkers; w++) {
+      const rows = rowsPerThread + (w < extraRows ? 1 : 0);
+      const rowEnd = rowStart + rows;
+
+      const slotBase = HEADER_INTS + w * SLOT_INTS;
+      this._control[slotBase + F_OP_TYPE] = OP_LM_HEAD;
+      this._control[slotBase + F_EMB_OFFSET] = embOffset;
+      this._control[slotBase + F_START_ROW] = rowStart;
+      this._control[slotBase + F_END_ROW] = rowEnd;
+      this._control[slotBase + F_K] = dim;
+
+      Atomics.store(this._control, slotBase + F_STATUS, WORK_READY);
+      Atomics.notify(this._control, slotBase + F_STATUS);
+
+      rowStart = rowEnd;
     }
 
-    const splitRow = vocabSize >>> 1;
+    // Main thread computes remaining rows
+    const mainStartRow = rowStart;
+    const mainN = vocabSize - mainStartRow;
 
-    // Copy hidden for the worker
-    const hiddenCopy = new Float32Array(dim);
-    hiddenCopy.set(hidden);
+    if (mainN > 0) {
+      const mainEmb = new Float32Array(
+        embData.buffer, embData.byteOffset + mainStartRow * dim * 4, mainN * dim
+      );
+      const mainResult = wasmQ4.lmHead(hidden, mainEmb, mainN, dim);
 
-    // embData must be backed by SharedArrayBuffer
-    const embOffset = embData.byteOffset;
-    const embLength = embData.byteLength;
+      const outView = new Float32Array(
+        this._ioBuf, this._maxK * 4 + mainStartRow * 4, mainN
+      );
+      outView.set(mainResult);
+    }
 
-    // Dispatch top half to worker
-    const workerPromise = this._dispatchLmHead(
-      hiddenCopy.buffer, embOffset, embLength,
-      0, splitRow, vocabSize, dim
-    );
+    // Wait for workers
+    for (let w = 0; w < activeWorkers; w++) {
+      const statusIdx = HEADER_INTS + w * SLOT_INTS + F_STATUS;
+      let waitResult = Atomics.wait(this._control, statusIdx, WORK_READY, WAIT_TIMEOUT_MS);
+      if (waitResult === 'timed-out') {
+        waitResult = Atomics.wait(this._control, statusIdx, WORK_READY, WAIT_TIMEOUT_MS);
+        if (waitResult === 'timed-out') {
+          throw new Error(`ThreadPool: worker ${w} timed out on lmHead (10s)`);
+        }
+      }
+    }
 
-    // Compute bottom half on main thread
-    const mainEmb = new Float32Array(embData.buffer, embData.byteOffset + splitRow * dim * 4, (vocabSize - splitRow) * dim);
-    const mainResult = wasmQ4.lmHead(hidden, mainEmb, vocabSize - splitRow, dim);
-
-    // Wait for worker
-    const workerMsg = await workerPromise;
-    const workerResult = new Float32Array(workerMsg.output);
-
-    // Concatenate
+    // Read combined output
     const logits = new Float32Array(vocabSize);
-    logits.set(workerResult, 0);
-    logits.set(mainResult, splitRow);
-
+    logits.set(new Float32Array(this._ioBuf, this._maxK * 4, vocabSize));
     return logits;
   }
 
   /**
-   * Shutdown the worker thread.
+   * Shutdown all worker threads.
    */
   async shutdown() {
-    if (this._worker) {
-      await this._worker.terminate();
-      this._worker = null;
-      this._ready = false;
+    if (!this._control) return;
+
+    for (let w = 0; w < this._workers.length; w++) {
+      const slotBase = HEADER_INTS + w * SLOT_INTS;
+      Atomics.store(this._control, slotBase + F_STATUS, SHUTDOWN);
+      Atomics.notify(this._control, slotBase + F_STATUS);
     }
+
+    const terminations = this._workers.map(w => w.terminate());
+    await Promise.all(terminations);
+
+    this._workers = [];
+    this._ready = false;
   }
 }
 
-module.exports = { MatvecThreadPool };
+module.exports = { AtomicsThreadPool };
